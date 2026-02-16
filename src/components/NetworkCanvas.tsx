@@ -3,6 +3,7 @@ import { Monitor, Network, Router } from 'lucide-react'
 import { useNetworkStore } from '../stores/networkStore'
 import { useBankStore } from '../stores/bankStore'
 import { ITEM_PRICES } from '../stores/inventoryStore'
+import { GRID_SIZE, findNearestFreePosition } from '../utils/grid'
 import type { DeviceType } from '../types/network'
 
 const ICON_SIZE = 40
@@ -23,6 +24,7 @@ export function NetworkCanvas() {
   const setConnecting = useNetworkStore((s) => s.setConnecting)
   const setConnectionSource = useNetworkStore((s) => s.setConnectionSource)
   const addConnection = useNetworkStore((s) => s.addConnection)
+  const sellDevice = useNetworkStore((s) => s.sellDevice)
   const spend = useBankStore((s) => s.spend)
 
   const containerRef = useRef<HTMLDivElement>(null)
@@ -33,33 +35,69 @@ export function NetworkCanvas() {
   } | null>(null)
 
   const [toast, setToast] = useState<string | null>(null)
+  const [contextMenu, setContextMenu] = useState<{
+    deviceId: string
+    x: number
+    y: number
+  } | null>(null)
 
-  // Show toast message
   const showToast = useCallback((msg: string) => {
     setToast(msg)
     setTimeout(() => setToast(null), 2500)
   }, [])
 
-  // Esc to cancel connection mode
+  // Esc to cancel connection mode, close context menu
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
-      if (e.key === 'Escape' && connectionState.isConnecting) {
-        setConnecting(false)
+      if (e.key === 'Escape') {
+        if (contextMenu) setContextMenu(null)
+        if (connectionState.isConnecting) setConnecting(false)
       }
     }
     window.addEventListener('keydown', handleKeyDown)
     return () => window.removeEventListener('keydown', handleKeyDown)
-  }, [connectionState.isConnecting, setConnecting])
+  }, [connectionState.isConnecting, setConnecting, contextMenu])
+
+  // Close context menu on any click outside
+  useEffect(() => {
+    if (!contextMenu) return
+    function handleClick() {
+      setContextMenu(null)
+    }
+    window.addEventListener('pointerdown', handleClick)
+    return () => window.removeEventListener('pointerdown', handleClick)
+  }, [contextMenu])
+
+  const handleContextMenu = useCallback(
+    (e: React.MouseEvent, deviceId: string) => {
+      e.preventDefault()
+      e.stopPropagation()
+      const rect = containerRef.current?.getBoundingClientRect()
+      if (!rect) return
+      setContextMenu({
+        deviceId,
+        x: e.clientX - rect.left,
+        y: e.clientY - rect.top,
+      })
+    },
+    []
+  )
+
+  const handleSell = useCallback(
+    (deviceId: string) => {
+      sellDevice(deviceId)
+      setContextMenu(null)
+    },
+    [sellDevice]
+  )
 
   const handleDeviceClick = useCallback(
     (deviceId: string) => {
       if (!connectionState.isConnecting) return
 
       if (!connectionState.sourceDeviceId) {
-        // First click — set source
         setConnectionSource(deviceId)
       } else {
-        // Second click — attempt connection, charge cable cost
         const cablePrice = ITEM_PRICES['Cat6 Cable']
         if (!spend(cablePrice)) {
           showToast('Not enough money for a cable')
@@ -69,12 +107,10 @@ export function NetworkCanvas() {
 
         const error = addConnection(connectionState.sourceDeviceId, deviceId)
         if (error) {
-          // Refund since connection failed
           useBankStore.getState().earn(cablePrice)
           showToast(error)
           setConnecting(false)
         }
-        // On success, addConnection already resets connectionState
       }
     },
     [connectionState, setConnectionSource, addConnection, spend, setConnecting, showToast]
@@ -82,7 +118,6 @@ export function NetworkCanvas() {
 
   const handlePointerDown = useCallback(
     (e: React.PointerEvent, deviceId: string, pos: { x: number; y: number }) => {
-      // In connecting mode, clicks select devices — don't drag
       if (connectionState.isConnecting) {
         handleDeviceClick(deviceId)
         return
@@ -113,11 +148,39 @@ export function NetworkCanvas() {
   )
 
   const handlePointerUp = useCallback(() => {
-    setDragging(null)
-  }, [])
+    if (!dragging || !containerRef.current) {
+      setDragging(null)
+      return
+    }
 
-  // Build a lookup for device positions by id
+    // Snap to grid and resolve collisions
+    const rect = containerRef.current.getBoundingClientRect()
+    const device = devices.find((d) => d.id === dragging.id)
+    if (device) {
+      const maxW = Math.floor(rect.width / GRID_SIZE) * GRID_SIZE
+      const maxH = Math.floor(rect.height / GRID_SIZE) * GRID_SIZE
+      const snapped = findNearestFreePosition(
+        device.position.x,
+        device.position.y,
+        devices,
+        dragging.id,
+        maxW,
+        maxH
+      )
+      updateDevicePosition(dragging.id, snapped.x, snapped.y)
+    }
+
+    setDragging(null)
+  }, [dragging, devices, updateDevicePosition])
+
   const deviceMap = new Map(devices.map((d) => [d.id, d]))
+
+  const contextDevice = contextMenu
+    ? devices.find((d) => d.id === contextMenu.deviceId)
+    : null
+  const sellPrice = contextDevice
+    ? ITEM_PRICES[contextDevice.type as keyof typeof ITEM_PRICES] ?? 0
+    : 0
 
   return (
     <div
@@ -127,8 +190,19 @@ export function NetworkCanvas() {
       }`}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
+      onContextMenu={(e) => e.preventDefault()}
     >
-      {/* SVG connection lines — behind devices */}
+      {/* Grid dots */}
+      <svg className="absolute inset-0 w-full h-full pointer-events-none">
+        <defs>
+          <pattern id="grid-dots" width={GRID_SIZE} height={GRID_SIZE} patternUnits="userSpaceOnUse">
+            <circle cx={GRID_SIZE / 2} cy={GRID_SIZE / 2} r={1} fill="rgba(75,85,99,0.3)" />
+          </pattern>
+        </defs>
+        <rect width="100%" height="100%" fill="url(#grid-dots)" />
+      </svg>
+
+      {/* SVG connection lines */}
       <svg className="absolute inset-0 w-full h-full pointer-events-none">
         {connections.map((conn) => {
           const source = deviceMap.get(conn.sourceDeviceId)
@@ -162,6 +236,7 @@ export function NetworkCanvas() {
       {devices.map((device) => {
         const Icon = DEVICE_ICON[device.type]
         const isSource = connectionState.sourceDeviceId === device.id
+        const isDragging = dragging?.id === device.id
         return (
           <div
             key={device.id}
@@ -169,9 +244,12 @@ export function NetworkCanvas() {
               connectionState.isConnecting
                 ? 'cursor-crosshair'
                 : 'cursor-grab active:cursor-grabbing'
-            } ${isSource ? 'ring-2 ring-yellow-400 rounded-lg' : ''}`}
+            } ${isSource ? 'ring-2 ring-yellow-400 rounded-lg' : ''} ${
+              isDragging ? '' : 'transition-[left,top] duration-150'
+            }`}
             style={{ left: device.position.x, top: device.position.y, width: DEVICE_W }}
             onPointerDown={(e) => handlePointerDown(e, device.id, device.position)}
+            onContextMenu={(e) => handleContextMenu(e, device.id)}
           >
             <Icon size={ICON_SIZE} className={isSource ? 'text-yellow-400' : 'text-blue-400'} />
             <span className="text-gray-400 text-[10px] truncate max-w-full">
@@ -185,6 +263,25 @@ export function NetworkCanvas() {
           </div>
         )
       })}
+
+      {/* Context Menu */}
+      {contextMenu && contextDevice && (
+        <div
+          className="absolute z-50 min-w-[160px] bg-black border border-green-800 rounded shadow-lg shadow-green-900/20 py-1"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <div className="px-3 py-1.5 text-green-500 text-xs font-mono border-b border-green-900/50 truncate">
+            {contextDevice.name}
+          </div>
+          <button
+            className="w-full text-left px-3 py-1.5 text-sm font-mono text-green-400 hover:bg-green-900/30 hover:text-green-300 transition-colors cursor-pointer"
+            onClick={() => handleSell(contextMenu.deviceId)}
+          >
+            Sell <span className="text-green-500">(+${sellPrice})</span>
+          </button>
+        </div>
+      )}
 
       {/* Toast */}
       {toast && (
